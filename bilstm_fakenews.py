@@ -37,6 +37,12 @@ torch.backends.cudnn.deterministic = True
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
 
+# GPU 信息
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    torch.cuda.empty_cache()
+
 # =============================================================
 # 1. DATA PREPROCESSING
 # =============================================================
@@ -118,9 +124,16 @@ def make_loaders(X_train, X_val, X_test, y_train, y_val, y_test,
     val_ds   = FakeNewsDataset(X_val,   y_val,   vocab, max_len)
     test_ds  = FakeNewsDataset(X_test,  y_test,  vocab, max_len)
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader   = DataLoader(val_ds,   batch_size=batch_size)
-    test_loader  = DataLoader(test_ds,  batch_size=batch_size)
+    # GPU优化：pin_memory加速数据传输到GPU
+    pin_memory = torch.cuda.is_available()
+    num_workers = 0  # Windows环境下设为0，Linux可用4
+    
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                             pin_memory=pin_memory, num_workers=num_workers)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size,
+                             pin_memory=pin_memory, num_workers=num_workers)
+    test_loader  = DataLoader(test_ds,  batch_size=batch_size,
+                             pin_memory=pin_memory, num_workers=num_workers)
     return train_loader, val_loader, test_loader
 
 
@@ -228,20 +241,26 @@ def run_experiment(X_train, X_val, X_test, y_train, y_val, y_test,
         X_train, X_val, X_test, y_train, y_val, y_test, vocab, batch_size
     )
     model = BiLSTMClassifier(vocab_size=len(vocab)).to(DEVICE)
+    
+    # 确保模型所有参数都在GPU上
+    if torch.cuda.is_available():
+        model = model.cuda()
+    
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, patience=3, factor=0.5, verbose=False
-    )
+    # scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    #     optimizer, patience=3, factor=0.5, verbose=False
+    # )
 
     history = {"train_loss": [], "train_acc": [], "test_acc": []}
     best_val_acc, best_state = 0, None
+    epoch_start_time = time.time()
 
     for epoch in range(1, num_epochs + 1):
         t_loss, t_acc = train_one_epoch(model, train_loader, criterion, optimizer)
         v_loss, v_acc, _, _ = evaluate(model, val_loader, criterion)
         _, te_acc, _, _     = evaluate(model, test_loader, criterion)
 
-        scheduler.step(v_loss)
+        # scheduler.step(v_loss)
         history["train_loss"].append(t_loss)
         history["train_acc"].append(t_acc)
         history["test_acc"].append(te_acc)
@@ -250,15 +269,25 @@ def run_experiment(X_train, X_val, X_test, y_train, y_val, y_test,
             best_val_acc = v_acc
             best_state   = {k: v.clone() for k, v in model.state_dict().items()}
 
+        # GPU内存用量显示
+        gpu_memory = ""
+        if torch.cuda.is_available():
+            gpu_memory = f" | GPU Mem: {torch.cuda.memory_allocated() / 1e9:.2f}GB"
+
         print(f"[{tag}] Epoch {epoch:02d} | "
               f"Loss {t_loss:.4f} | TrainAcc {t_acc:.4f} | "
-              f"ValAcc {v_acc:.4f} | TestAcc {te_acc:.4f}")
+              f"ValAcc {v_acc:.4f} | TestAcc {te_acc:.4f}{gpu_memory}")
 
     # Load best model and get final predictions
     model.load_state_dict(best_state)
     _, _, final_preds, final_labels = evaluate(model, test_loader, criterion)
     history["final_preds"]  = final_preds
     history["final_labels"] = final_labels
+    
+    # 打印总训练时间
+    total_time = time.time() - epoch_start_time
+    print(f"[{tag}] ✅ Training completed in {total_time/60:.2f} minutes")
+    
     return history
 
 
@@ -378,6 +407,8 @@ def plot_predictions_table(preds, labels, texts, save_path, n=100):
 if __name__ == "__main__":
 
     # ── Load data ─────────────────────────────────────────
+    start_time = time.time()
+    
     CSV_PATH = "fakenews.csv"   # ← change if needed
     X_train, X_val, X_test, y_train, y_val, y_test = load_data(CSV_PATH)
     vocab = build_vocab(X_train, max_vocab=20000)
@@ -482,4 +513,6 @@ if __name__ == "__main__":
         target_names=["FAKE", "REAL"]
     ))
 
-    print("\n✅ All experiments done! Figures saved in ./figures/")
+    total_time = time.time() - start_time
+    print(f"\n✅ All experiments done! Figures saved in ./figures/")
+    print(f"⏱️  Total time: {total_time/60:.2f} minutes ({total_time/3600:.2f} hours)")
